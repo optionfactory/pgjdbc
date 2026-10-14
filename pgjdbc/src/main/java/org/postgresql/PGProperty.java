@@ -888,6 +888,17 @@ public enum PGProperty {
       "The Windows SSPI service class for SPN"),
 
   /**
+   * Streams the rows of forward-only result sets as they arrive from the backend, instead of
+   * buffering the whole result (or fetching it in batches through a portal). Rows are read from
+   * the socket only when {@code ResultSet.next()} needs them, so TCP flow control throttles the
+   * backend. The statement's fetch size, when positive, is the number of rows read per batch.
+   */
+  STREAM_RESULTS(
+      "streamResults",
+      "false",
+      "Stream forward-only result sets from the socket without cursors or full buffering."),
+
+  /**
    * Bind String to either {@code unspecified} or {@code varchar}. Default is {@code varchar} for
    * 8.0+ backends.
    */

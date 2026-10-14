@@ -398,4 +398,29 @@ public interface PGConnection {
    * @return state of adaptive fetch (turned on or off)
    */
   boolean getAdaptiveFetch();
+
+  /**
+   * Turn on/off results streaming for connection. The change applies to the queries executed after
+   * it, by new and existing statements alike; result sets already open are not affected.
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}: implementations
+   * that can stream results override it.</p>
+   *
+   * @param streamResults desired state of results streaming
+   */
+  default void setStreamResults(boolean streamResults) {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Get state of results streaming for connection.
+   *
+   * <p>The default implementation returns {@code false}: implementations that can stream results
+   * override it.</p>
+   *
+   * @return whether forward-only result sets should be streamed, see {@code streamResults}
+   */
+  default boolean getStreamResults() {
+    return false;
+  }
 }

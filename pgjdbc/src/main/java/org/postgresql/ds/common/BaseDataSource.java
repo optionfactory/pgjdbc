@@ -1882,6 +1882,22 @@ public abstract class BaseDataSource implements CommonDataSource, Referenceable 
     PGProperty.ADAPTIVE_FETCH_MINIMUM.set(properties, adaptiveFetchMinimum);
   }
 
+  /**
+   * @return whether forward-only result sets are streamed
+   * @see PGProperty#STREAM_RESULTS
+   */
+  public boolean getStreamResults() {
+    return PGProperty.STREAM_RESULTS.getBoolean(properties);
+  }
+
+  /**
+   * @param streamResults whether forward-only result sets are streamed
+   * @see PGProperty#STREAM_RESULTS
+   */
+  public void setStreamResults(boolean streamResults) {
+    PGProperty.STREAM_RESULTS.set(properties, streamResults);
+  }
+
   @Override
   public Logger getParentLogger() {
     return Logger.getLogger("org.postgresql");

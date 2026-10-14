@@ -45,6 +45,8 @@
   *    - Unlocked: lockedFor == null, connection available
   *    - Locked: lockedFor != null, held by specific operation (e.g., CopyOperation)
   *    Methods: lock(), unlock(), waitOnLock(), hasLock()
+  *    A streamed result set (streaming != null) does not take the lock: waitOnLock() reads the
+  *    rest of its rows in memory instead of waiting.
   *
   * 6. AUTOSAVE STATE MACHINE
   *    When AutoSave is enabled, wraps queries in savepoints:
@@ -233,6 +235,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
   private static final int MIN_FIELD_DESCRIPTION_LENGTH = 1 + 4 + 2 + 4 + 2 + 4 + 2;
 
   /**
+   * The default number of rows read at a time when the fetch size is not set and results streaming
+   * is enabled.
+   */
+  private static final int DEFAULT_STREAM_BATCH_SIZE = 1024;
+
+  /**
    * This caches the latest observed {@code set search_path} query so the reset of prepared
    * statement cache can be skipped if using repeated calls for the same {@code set search_path}
    * value.
@@ -253,6 +261,8 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
   private final AdaptiveFetchCache adaptiveFetchCache;
 
+  private boolean streamResults;
+
   private boolean inExtendedProtocol;
 
   @SuppressWarnings({"assignment", "argument",
@@ -263,6 +273,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
     long maxResultBuffer = pgStream.getMaxResultBuffer();
     this.adaptiveFetchCache = new AdaptiveFetchCache(maxResultBuffer, info);
+    this.streamResults = PGProperty.STREAM_RESULTS.getBoolean(info);
 
     this.allowEncodingChanges = PGProperty.ALLOW_ENCODING_CHANGES.getBoolean(info);
     this.cleanupSavePoints = PGProperty.CLEANUP_SAVEPOINTS.getBoolean(info);
@@ -324,8 +335,14 @@ public class QueryExecutorImpl extends QueryExecutorBase {
   /**
    * Wait until our lock is released. Execution of a single synchronized method can then continue
    * without further ado. Must be called at beginning of each synchronized public method.
+   *
+   * <p>A result set being streamed is read in memory first: the connection cannot be used while
+   * its rows are still in the socket.</p>
    */
   private void waitOnLock() throws PSQLException {
+    if (streaming != null) {
+      spillStreaming(streaming);
+    }
     while (lockedFor != null) {
       try {
         lockCondition.await();
@@ -454,6 +471,17 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         try {
           handler = sendQueryPreamble(handler, flags);
           autosave = sendAutomaticSavepoint(query, flags);
+          if (autosave
+              || (flags & QUERY_EXECUTE_AS_SIMPLE) != 0
+              || query.getSubqueries() != null) {
+            // Read the whole result when it is not the only one before ReadyForQuery: the
+            // statements of a multi-statement query, or the RELEASE SAVEPOINT that autosave
+            // sends before the rows are read.
+            flags &= ~QUERY_STREAM_RESULTS;
+          }
+          streamBatchSize = (flags & QUERY_STREAM_RESULTS) == 0
+              ? Integer.MAX_VALUE
+              : fetchSize > 0 ? fetchSize : DEFAULT_STREAM_BATCH_SIZE;
           sendQuery(query, (V3ParameterList) parameters, maxRows, fetchSize, flags,
               handler, null, adaptiveFetch);
           if ((flags & QueryExecutor.QUERY_EXECUTE_AS_SIMPLE) != 0) {
@@ -2403,6 +2431,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       throws IOException {
     boolean noResults = (flags & QueryExecutor.QUERY_NO_RESULTS) != 0;
     boolean bothRowsAndStatus = (flags & QueryExecutor.QUERY_BOTH_ROWS_AND_STATUS) != 0;
+    boolean streamResultsFlag = (flags & QueryExecutor.QUERY_STREAM_RESULTS) != 0;
 
     List<Tuple> tuples = null;
 
@@ -2698,6 +2727,21 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             LOGGER.log(Level.FINEST, " <=BE DataRow(len={0})", length);
           }
 
+          if (streamResultsFlag && !noResults && !bothRowsAndStatus
+              && tuples != null && tuples.size() >= streamBatchSize) {
+            StreamingCursor cursor = streaming;
+            if (cursor == null) {
+              SimpleQuery currentQuery = castNonNull(pendingExecuteQueue.peekFirst()).query;
+              Field[] fields = castNonNull(currentQuery.getFields());
+              cursor = new StreamingCursor(flags, streamBatchSize, currentQuery, fields);
+              streaming = cursor;
+            }
+            // maxResultBuffer bounds what is held in memory, that is a single batch
+            pgStream.clearResultBufferCount();
+            handler.handleResultRows(cursor.query, cursor.fields, tuples, cursor);
+            return;
+          }
+
           break;
 
         case PgMessageType.ERROR_RESPONSE:
@@ -2791,6 +2835,9 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             }
           }
           endQuery = true;
+          if (streaming != null) {
+            endStreaming();
+          }
 
           // Reset the statement name of Parses that failed.
           while (!pendingParseQueue.isEmpty()) {
@@ -2898,6 +2945,14 @@ public class QueryExecutorImpl extends QueryExecutorBase {
   public void fetch(ResultCursor cursor, ResultHandler handler, int fetchSize,
       boolean adaptiveFetch) throws SQLException {
     try (ResourceLock ignore = lock.obtain()) {
+      // waitOnLock() is called at the beginning of each public method with locking, as its
+      // documentation explains, except here: in the streaming case we already "own" the connection
+      if (cursor instanceof StreamingCursor) {
+        // the rows of this cursor are next in the socket: reading them must not spill it
+        fetchStreaming((StreamingCursor) cursor, handler, fetchSize);
+        return;
+      }
+
       waitOnLock();
       final Portal portal = (Portal) cursor;
 
@@ -2975,6 +3030,177 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         adaptiveFetchCache.removeQuery(adaptiveFetch, query);
       }
     }
+  }
+
+  @Override
+  public boolean getStreamResults() {
+    return streamResults;
+  }
+
+  @Override
+  public void setStreamResults(boolean streamResults) {
+    this.streamResults = streamResults;
+  }
+
+  /**
+   * The result set being streamed, if any: the rest of its rows are still in the socket. Unlike
+   * {@link #lockedFor}, it does not make other operations wait: {@link #waitOnLock()} reads the
+   * rest of its rows in memory, so that they can use the connection.
+   */
+  private @Nullable StreamingCursor streaming;
+
+  /**
+   * Rows read from the socket before {@link #processResults} hands a streamed batch over.
+   */
+  private int streamBatchSize = Integer.MAX_VALUE;
+
+  /**
+   * A result set whose rows are still arriving. Unlike a {@link Portal}, fetching more rows sends
+   * nothing to the backend: it only reads the DataRow messages already on their way.
+   */
+  private final class StreamingCursor implements ResultCursor {
+
+    final int flags;
+    final int batchSize;
+    final SimpleQuery query;
+    final Field[] fields;
+
+    /** Rows read eagerly because the connection was needed for something else. */
+    @Nullable List<Tuple> spilled;
+    @Nullable SQLException spillError;
+
+    StreamingCursor(int flags, int batchSize, SimpleQuery query, Field[] fields) {
+      this.flags = flags;
+      this.batchSize = batchSize;
+      this.query = query;
+      this.fields = fields;
+    }
+
+    @Override
+    public void close() {
+      closeStreaming(this);
+    }
+  }
+
+  /**
+   * Cancels the query of a result closed before its end, then discards what the backend sent
+   * until ReadyForQuery. The query is aborted, together with the transaction if one is open.
+   *
+   * <p>The cancel request cannot hit a later query: {@link #sendQueryCancel()} returns once the
+   * postmaster has signaled the backend, and nothing else is sent before ReadyForQuery. A signal
+   * that reaches the backend after the query is over finds it reading a command, so it is
+   * ignored.</p>
+   */
+  private void closeStreaming(StreamingCursor cursor) {
+    try (ResourceLock ignore = lock.obtain()) {
+      if (streaming != cursor) {
+        cursor.spilled = null;
+        return;
+      }
+      try {
+        sendQueryCancel();
+      } catch (SQLException e) {
+        // the rest of the result is read and discarded anyway
+        LOGGER.log(Level.FINEST, "Ignoring exception on cancel request:", e);
+      }
+      try {
+        processResults(new DiscardResultHandler(), cursor.flags | QUERY_NO_RESULTS);
+      } catch (IOException e) {
+        return;
+      } finally {
+        abandonStreaming(cursor);
+      }
+      // an aborted implicit transaction leaves the connection idle
+      if (getTransactionState() == TransactionState.FAILED) {
+        addWarning(new SQLWarning(
+            GT.tr("A result set was closed before its end: its query was canceled and the transaction aborted."),
+            PSQLState.QUERY_CANCELED.getState()));
+      }
+    }
+  }
+
+  /**
+   * Releases the connection from a streamed result whose rows cannot be read to ReadyForQuery,
+   * for instance because {@code maxResultBuffer} was exceeded: the connection is closed.
+   */
+  private void abandonStreaming(StreamingCursor cursor) {
+    if (streaming == cursor) {
+      abort();
+      endStreaming();
+    }
+  }
+
+  private void fetchStreaming(StreamingCursor cursor, ResultHandler handler, int fetchSize) throws SQLException {
+    if (cursor.spilled != null || streaming != cursor) {
+      // read already, or closed
+      List<Tuple> spilled = cursor.spilled != null ? cursor.spilled : new ArrayList<>();
+      cursor.spilled = null;
+      handler.handleResultRows(cursor.query, cursor.fields, spilled, null);
+      if (cursor.spillError != null) {
+        handler.handleError(cursor.spillError);
+      }
+      handler.handleCompletion();
+      return;
+    }
+    try {
+      // the fetch size of the result set, which may have changed since the query
+      streamBatchSize = fetchSize > 0 ? fetchSize : cursor.batchSize;
+      processResults(handler, cursor.flags);
+      if (pgStream.isBroken()) {
+        abandonStreaming(cursor);
+      }
+    } catch (IOException e) {
+      abandonStreaming(cursor);
+      handler.handleError(
+          new PSQLException(GT.tr("An I/O error occurred while sending to the backend."),
+              PSQLState.CONNECTION_FAILURE, e));
+    }
+    handler.handleCompletion();
+  }
+
+  /**
+   * Reads the rest of a streamed result in memory, so that the connection can be used again.
+   */
+  private void spillStreaming(StreamingCursor cursor) throws PSQLException {
+    final List<Tuple> rows = new ArrayList<>();
+    final ResultHandlerBase collector = new ResultHandlerBase() {
+      @Override
+      public void handleResultRows(Query fromQuery, Field[] fields, List<Tuple> tuples,
+          @Nullable ResultCursor c) {
+        rows.addAll(tuples);
+      }
+
+      @Override
+      public void handleWarning(SQLWarning warning) {
+      }
+    };
+    try {
+      streamBatchSize = Integer.MAX_VALUE;
+      processResults(collector, cursor.flags);
+    } catch (IOException e) {
+      abandonStreaming(cursor);
+      throw new PSQLException(
+          GT.tr("An I/O error occurred while sending to the backend."),
+          PSQLState.CONNECTION_FAILURE, e);
+    }
+    cursor.spilled = rows;
+    cursor.spillError = collector.getException();
+    if (streaming == cursor) {
+      // the connection broke before ReadyForQuery, for instance on maxResultBuffer
+      abandonStreaming(cursor);
+      SQLException cause = cursor.spillError;
+      if (cause instanceof PSQLException) {
+        throw (PSQLException) cause;
+      }
+      throw new PSQLException(
+          GT.tr("An I/O error occurred while sending to the backend."),
+          PSQLState.CONNECTION_FAILURE, cause);
+    }
+  }
+
+  private void endStreaming() {
+    streaming = null;
+    streamBatchSize = Integer.MAX_VALUE;
   }
 
   /*

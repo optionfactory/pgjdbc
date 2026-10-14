@@ -479,6 +479,13 @@ public class PgStatement implements Statement, BaseStatement {
       flags |= QueryExecutor.QUERY_FORWARD_CURSOR;
     }
 
+    // Stream forward-only results straight from the socket: no portal, no round trips between
+    // batches, no transaction required. Takes precedence over the cursor based fetch.
+    if (connection.getQueryExecutor().getStreamResults() && !wantsScrollableResultSet()) {
+      flags &= ~QueryExecutor.QUERY_FORWARD_CURSOR;
+      flags |= QueryExecutor.QUERY_STREAM_RESULTS;
+    }
+
     if (wantsGeneratedKeysOnce || wantsGeneratedKeysAlways) {
       flags |= QueryExecutor.QUERY_BOTH_ROWS_AND_STATUS;
 

@@ -4,6 +4,9 @@ Notable changes since version 42.0.0, read the complete [History of Changes](htt
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
+### Added
+* feat: `streamResults` connection property. Forward-only result sets are read from the socket as `ResultSet.next()` needs them, without a cursor, a transaction or a round trip between batches of rows, so a large result needs memory for one batch only. Closing such a result set before its end cancels its query, and aborts the transaction if one is open. `PGConnection.setStreamResults(boolean)` and `getStreamResults()` change and read the setting of an open connection; the change applies to the queries executed after it.
+
 ### Fixed
 * fix: `PGStream.skip` no longer loops forever when the connection ends while the driver is discarding bytes, and no longer mistakes a stream that skips nothing for one that has ended. `InputStream.skip` may return zero with more data still coming, which a stream supplied through the `socketFactory` property is free to do; the driver now reads a byte in that case and treats only `-1` as the end [PR #4358](https://github.com/pgjdbc/pgjdbc/pull/4358)
 * fix: `LargeObjectManager` operations now work inside an active XA transaction. Since 42.7.13 an XA branch keeps the caller's `autoCommit=true`, and the guard rejected large objects as if the connection were idle. It now checks the server transaction state (`getTransactionState()`) instead of `autoCommit`, so a genuine auto-commit connection with no open transaction is still refused [Issue #4309](https://github.com/pgjdbc/pgjdbc/issues/4309) [PR #4310](https://github.com/pgjdbc/pgjdbc/pull/4310)

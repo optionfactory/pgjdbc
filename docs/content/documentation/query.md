@@ -155,6 +155,58 @@ rs.close();
 st.close();
 ```
 
+## Streaming results
+
+With the `streamResults` connection property set to `true`, the driver reads the rows of a forward-only `ResultSet`
+from the socket only when `next()` needs them. The query is sent once, as usual: the backend sends its rows as it
+produces them, and stops while the driver does not read them. Unlike a cursor based `ResultSet`, this works in
+autocommit mode and there is no round trip between batches of rows. The fetch size sets how many rows are read at a
+time, 1024 when it is not set. A forward-only `ResultSet` is streamed even where the driver would otherwise use a
+cursor, as described in the previous section.
+
+An open connection can turn streaming on or off with `PGConnection.setStreamResults(boolean)`. The change applies to
+the queries executed after it, by new and existing statements; result sets already open are not affected.
+
+Until the `ResultSet` has read its last row or is closed, the rest of its rows are still in the socket:
+
+* Any other operation on the same connection, such as running another statement, committing, or a `COPY`, first
+  reads the rest of the result in memory. The `ResultSet` stays valid.
+
+* Closing the `ResultSet` before `next()` returns `false` sends a cancel request for its query and discards what the
+  backend sent.
+  The query is aborted, and so is the transaction if one is open: the following statements fail until it is rolled
+  back, and `Connection.getWarnings()` reports the abort. A statement that has produced all its rows before the
+  cancel request arrives, such as an `INSERT ... RETURNING`, completes anyway.
+
+* `maxResultBuffer` limits each batch of rows. When the rest of a result is read in memory, it limits the rest as a
+  whole: exceeding it closes the connection, as for a result that is not streamed.
+
+* `Statement.setQueryTimeout` limits the time until the first batch of rows. PostgreSQL counts the time the
+  application spends reading rows towards `statement_timeout`.
+
+* `adaptiveFetch` does not apply to streamed results.
+
+The following read the whole result, as before:
+
+* scrollable result sets;
+* multi-statement queries;
+* statements run over the simple protocol (every statement with `preferQueryMode=simple`, and a plain `Statement` with
+  `preferQueryMode=extendedForPrepared`);
+* statements that return generated keys;
+* statements protected by an `autosave` savepoint.
+
+##### Streaming a large result
+
+```java
+// jdbc:postgresql://localhost/test?streamResults=true
+try (Statement st = conn.createStatement();
+     ResultSet rs = st.executeQuery("SELECT * FROM mytable")) {
+    while (rs.next()) {
+        process(rs);
+    }
+}
+```
+
 ## Using the Statement or PreparedStatement Interface
 
 The following must be considered when using the `Statement` or `PreparedStatement` interface:
