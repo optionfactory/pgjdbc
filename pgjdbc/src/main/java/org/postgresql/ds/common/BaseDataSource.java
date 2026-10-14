@@ -1882,6 +1882,39 @@ public abstract class BaseDataSource implements CommonDataSource, Referenceable 
     PGProperty.ADAPTIVE_FETCH_MINIMUM.set(properties, adaptiveFetchMinimum);
   }
 
+  /**
+   * @return whether forward-only result sets are streamed
+   * @see PGProperty#STREAM_RESULTS
+   */
+  public boolean getStreamResults() {
+    return PGProperty.STREAM_RESULTS.getBoolean(properties);
+  }
+
+  /**
+   * @param streamResults whether forward-only result sets are streamed
+   * @see PGProperty#STREAM_RESULTS
+   */
+  public void setStreamResults(boolean streamResults) {
+    PGProperty.STREAM_RESULTS.set(properties, streamResults);
+  }
+
+  /**
+   * @return the longest time in milliseconds a batch of streamed rows waits to fill up
+   * @see PGProperty#STREAM_RESULTS_MAX_WAIT
+   */
+  public int getStreamResultsMaxWait() {
+    return PGProperty.STREAM_RESULTS_MAX_WAIT.getIntNoCheck(properties);
+  }
+
+  /**
+   * @param streamResultsMaxWait the longest time in milliseconds a batch of streamed rows waits to
+   *     fill up, 0 to wait for a full batch
+   * @see PGProperty#STREAM_RESULTS_MAX_WAIT
+   */
+  public void setStreamResultsMaxWait(int streamResultsMaxWait) {
+    PGProperty.STREAM_RESULTS_MAX_WAIT.set(properties, streamResultsMaxWait);
+  }
+
   @Override
   public Logger getParentLogger() {
     return Logger.getLogger("org.postgresql");

@@ -517,6 +517,26 @@ By default, minimum of rows calculated by `adaptiveFetch` is 0.
 Specifies the highest number of rows which can be calculated by `adaptiveFetch`. Requires `adaptiveFetch` set to `true` to work.
 By default, maximum of rows calculated by `adaptiveFetch` is -1, which is understood as infinite.
 
+* **`streamResults (`*boolean*`)`** *Default `false`*\
+Reads the rows of forward-only result sets from the socket as `ResultSet.next()` needs them, instead of reading the
+whole result before the query returns or fetching it in batches through a cursor. No transaction is required, and no
+round trip is made between batches: TCP flow control makes the backend wait while the application processes rows.
+The fetch size, when positive, is the number of rows read at a time; otherwise 1024.
+Until the result set is read to its end or closed, the rest of its rows are still in the socket: any other operation
+on the same connection reads them in memory first. Closing the result set before its end cancels the query, and
+aborts the transaction if one is open. Scrollable result sets, multi-statement queries, statements run over the simple
+protocol (`preferQueryMode=simple`, and plain statements with `extendedForPrepared`), statements that return
+generated keys and statements protected by an `autosave` savepoint read the whole result as before. `adaptiveFetch`
+does not apply to streamed results. An open connection can change the setting with
+`PGConnection.setStreamResults(boolean)`. See [Streaming results](/documentation/query/#streaming-results).
+
+* **`streamResultsMaxWait (`*int*`)`** *Default `0`*\
+The longest time, in milliseconds, that reading a batch of streamed rows waits for the batch to fill up. When it runs
+out, `ResultSet.next()` returns with the rows read so far, at least one, even if they are fewer than the fetch size.
+The time counts from when the driver starts reading the batch. `0` waits until the batch is full or the result ends.
+Requires `streamResults` set to `true`. An open connection can change the setting with
+`PGConnection.setStreamResultsMaxWait(int)`. See [Streaming results](/documentation/query/#streaming-results).
+
 * **`logServerErrorDetail (`*boolean*`)`** *Default `true`*\
 Whether to include server error details in exceptions and log messages (for example inlined query parameters).
 Setting to `false` will only include minimal, not sensitive messages.

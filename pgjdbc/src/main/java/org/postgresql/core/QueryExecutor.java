@@ -131,6 +131,13 @@ public interface QueryExecutor extends TypeTransferModeRegistry {
   int QUERY_READ_ONLY_HINT = 2048;
 
   /**
+   * Flag indicating that the rows of the result set may be streamed from the socket: the query
+   * returns after the first batch of rows, and the rest stays in the socket until the result set
+   * reads it or another operation on the connection reads it into memory.
+   */
+  int QUERY_STREAM_RESULTS = 4096;
+
+  /**
    * Execute a Query, passing results to a provided ResultHandler.
    *
    * @param query the query to execute; must be a query returned from calling
@@ -657,4 +664,33 @@ public interface QueryExecutor extends TypeTransferModeRegistry {
    *                      Portal class.
    */
   void removeQueryFromAdaptiveFetchCache(boolean adaptiveFetch, ResultCursor cursor);
+
+  /**
+   * Get state of results streaming inside QueryExecutor.
+   *
+   * @return whether forward-only result sets should be streamed, see {@code streamResults}
+   */
+  boolean getStreamResults();
+
+  /**
+   * Set state of results streaming inside QueryExecutor.
+   *
+   * @param streamResults desired state of results streaming
+   */
+  void setStreamResults(boolean streamResults);
+
+  /**
+   * Get the longest time a batch of streamed rows waits to fill up inside QueryExecutor.
+   *
+   * @return the longest time in milliseconds, 0 if a batch waits until it is full
+   */
+  int getStreamResultsMaxWait();
+
+  /**
+   * Set the longest time a batch of streamed rows waits to fill up inside QueryExecutor.
+   *
+   * @param streamResultsMaxWait the longest time in milliseconds; 0 disables the timeout and waits
+   *                             for a full batch; a negative value sets the property to 0
+   */
+  void setStreamResultsMaxWait(int streamResultsMaxWait);
 }

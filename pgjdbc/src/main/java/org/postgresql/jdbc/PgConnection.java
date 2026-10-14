@@ -1995,6 +1995,26 @@ public class PgConnection implements BaseConnection {
   }
 
   @Override
+  public boolean getStreamResults() {
+    return queryExecutor.getStreamResults();
+  }
+
+  @Override
+  public void setStreamResults(boolean streamResults) {
+    queryExecutor.setStreamResults(streamResults);
+  }
+
+  @Override
+  public int getStreamResultsMaxWait() {
+    return queryExecutor.getStreamResultsMaxWait();
+  }
+
+  @Override
+  public void setStreamResultsMaxWait(int streamResultsMaxWait) {
+    queryExecutor.setStreamResultsMaxWait(Math.max(0, streamResultsMaxWait));
+  }
+
+  @Override
   public PGXmlFactoryFactory getXmlFactoryFactory() throws SQLException {
     PGXmlFactoryFactory xmlFactoryFactory = this.xmlFactoryFactory;
     if (xmlFactoryFactory != null) {
