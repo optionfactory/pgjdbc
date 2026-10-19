@@ -423,4 +423,34 @@ public interface PGConnection {
   default boolean getStreamResults() {
     return false;
   }
+
+  /**
+   * Set the longest time, in milliseconds, a batch of streamed rows waits to fill up for
+   * connection. The change applies to the queries executed after it, by new and existing statements
+   * alike; result sets already open are not affected.
+   *
+   * <p>The default implementation throws {@link UnsupportedOperationException}: implementations
+   * that can stream results override it.</p>
+   *
+   * @param streamResultsMaxWait the longest time in milliseconds; 0 disables the timeout and waits
+   *                             for a full batch; a negative value sets the property to 0
+   */
+  default void setStreamResultsMaxWait(int streamResultsMaxWait) {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Get the longest time, in milliseconds, a batch of streamed rows waits to fill up for
+   * connection. This threshold is ignored while the current batch of stream results is empty, which
+   * is returned immediately upon the arrival of a row or the end of the stream.
+   *
+   * <p>The default implementation returns {@code 0} (disabled): implementations that can stream
+   * results should override it.</p>
+   *
+   * @return the longest time in milliseconds for waiting a complete batch while streaming, 0 if a
+   * batch should wait until it is completely full
+   */
+  default int getStreamResultsMaxWait() {
+    return 0;
+  }
 }

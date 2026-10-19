@@ -263,6 +263,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
   private boolean streamResults;
 
+  /**
+   * The longest time, in milliseconds, a batch of streamed rows waits to fill up, see
+   * {@code streamResultsMaxWait}. 0 waits for a full batch.
+   */
+  private int streamResultsMaxWait;
+
   private boolean inExtendedProtocol;
 
   @SuppressWarnings({"assignment", "argument",
@@ -274,6 +280,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     long maxResultBuffer = pgStream.getMaxResultBuffer();
     this.adaptiveFetchCache = new AdaptiveFetchCache(maxResultBuffer, info);
     this.streamResults = PGProperty.STREAM_RESULTS.getBoolean(info);
+    this.streamResultsMaxWait = Math.max(0, PGProperty.STREAM_RESULTS_MAX_WAIT.getInt(info));
 
     this.allowEncodingChanges = PGProperty.ALLOW_ENCODING_CHANGES.getBoolean(info);
     this.cleanupSavePoints = PGProperty.CLEANUP_SAVEPOINTS.getBoolean(info);
@@ -482,6 +489,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           streamBatchSize = (flags & QUERY_STREAM_RESULTS) == 0
               ? Integer.MAX_VALUE
               : fetchSize > 0 ? fetchSize : DEFAULT_STREAM_BATCH_SIZE;
+          streamBatchMaxWait = (flags & QUERY_STREAM_RESULTS) == 0 ? 0 : streamResultsMaxWait;
           sendQuery(query, (V3ParameterList) parameters, maxRows, fetchSize, flags,
               handler, null, adaptiveFetch);
           if ((flags & QueryExecutor.QUERY_EXECUTE_AS_SIMPLE) != 0) {
@@ -2432,6 +2440,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     boolean noResults = (flags & QueryExecutor.QUERY_NO_RESULTS) != 0;
     boolean bothRowsAndStatus = (flags & QueryExecutor.QUERY_BOTH_ROWS_AND_STATUS) != 0;
     boolean streamResultsFlag = (flags & QueryExecutor.QUERY_STREAM_RESULTS) != 0;
+    // A streamed batch that has rows is handed over when it does not fill up in time
+    boolean timedBatch = streamResultsFlag && streamBatchMaxWait > 0 && !noResults
+        && !bothRowsAndStatus;
+    long batchDeadline = timedBatch
+        ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(streamBatchMaxWait)
+        : 0;
 
     List<Tuple> tuples = null;
 
@@ -2446,6 +2460,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     boolean doneAfterRowDescNoData = false;
 
     while (!endQuery) {
+      if (timedBatch && tuples != null && !tuples.isEmpty()
+          && !pgStream.waitForMessage(millisUntil(batchDeadline))) {
+        // the batch did not fill up in time: hand over the rows read so far
+        handOverStreamedBatch(handler, flags, tuples);
+        return;
+      }
       c = pgStream.receiveMessageType();
       switch (c) {
         case 'A': // Asynchronous Notify
@@ -2729,16 +2749,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
           if (streamResultsFlag && !noResults && !bothRowsAndStatus
               && tuples != null && tuples.size() >= streamBatchSize) {
-            StreamingCursor cursor = streaming;
-            if (cursor == null) {
-              SimpleQuery currentQuery = castNonNull(pendingExecuteQueue.peekFirst()).query;
-              Field[] fields = castNonNull(currentQuery.getFields());
-              cursor = new StreamingCursor(flags, streamBatchSize, currentQuery, fields);
-              streaming = cursor;
-            }
-            // maxResultBuffer bounds what is held in memory, that is a single batch
-            pgStream.clearResultBufferCount();
-            handler.handleResultRows(cursor.query, cursor.fields, tuples, cursor);
+            handOverStreamedBatch(handler, flags, tuples);
             return;
           }
 
@@ -3042,6 +3053,16 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     this.streamResults = streamResults;
   }
 
+  @Override
+  public int getStreamResultsMaxWait() {
+    return streamResultsMaxWait;
+  }
+
+  @Override
+  public void setStreamResultsMaxWait(int streamResultsMaxWait) {
+    this.streamResultsMaxWait = Math.max(0, streamResultsMaxWait);
+  }
+
   /**
    * The result set being streamed, if any: the rest of its rows are still in the socket. Unlike
    * {@link #lockedFor}, it does not make other operations wait: {@link #waitOnLock()} reads the
@@ -3055,6 +3076,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
   private int streamBatchSize = Integer.MAX_VALUE;
 
   /**
+   * The longest time, in milliseconds, {@link #processResults} waits for a streamed batch to fill
+   * up once it holds a row. 0 waits for a full batch.
+   */
+  private int streamBatchMaxWait;
+
+  /**
    * A result set whose rows are still arriving. Unlike a {@link Portal}, fetching more rows sends
    * nothing to the backend: it only reads the DataRow messages already on their way.
    */
@@ -3062,6 +3089,8 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
     final int flags;
     final int batchSize;
+    /** The {@code streamResultsMaxWait} of the query: a later change does not apply to it. */
+    final int maxWait;
     final SimpleQuery query;
     final Field[] fields;
 
@@ -3069,9 +3098,10 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     @Nullable List<Tuple> spilled;
     @Nullable SQLException spillError;
 
-    StreamingCursor(int flags, int batchSize, SimpleQuery query, Field[] fields) {
+    StreamingCursor(int flags, int batchSize, int maxWait, SimpleQuery query, Field[] fields) {
       this.flags = flags;
       this.batchSize = batchSize;
+      this.maxWait = maxWait;
       this.query = query;
       this.fields = fields;
     }
@@ -3145,6 +3175,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     try {
       // the fetch size of the result set, which may have changed since the query
       streamBatchSize = fetchSize > 0 ? fetchSize : cursor.batchSize;
+      streamBatchMaxWait = cursor.maxWait;
       processResults(handler, cursor.flags);
       if (pgStream.isBroken()) {
         abandonStreaming(cursor);
@@ -3176,6 +3207,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     };
     try {
       streamBatchSize = Integer.MAX_VALUE;
+      streamBatchMaxWait = 0;
       processResults(collector, cursor.flags);
     } catch (IOException e) {
       abandonStreaming(cursor);
@@ -3201,6 +3233,39 @@ public class QueryExecutorImpl extends QueryExecutorBase {
   private void endStreaming() {
     streaming = null;
     streamBatchSize = Integer.MAX_VALUE;
+    streamBatchMaxWait = 0;
+  }
+
+  /**
+   * Hands the rows read so far over to the handler as a batch of a streamed result, the first of
+   * which starts streaming it.
+   */
+  private void handOverStreamedBatch(ResultHandler handler, int flags, List<Tuple> tuples) {
+    StreamingCursor cursor = streaming;
+    if (cursor == null) {
+      SimpleQuery currentQuery = castNonNull(pendingExecuteQueue.peekFirst()).query;
+      Field[] fields = castNonNull(currentQuery.getFields());
+      cursor = new StreamingCursor(flags, streamBatchSize, streamBatchMaxWait, currentQuery,
+          fields);
+      streaming = cursor;
+    }
+    // maxResultBuffer bounds what is held in memory, that is a single batch
+    pgStream.clearResultBufferCount();
+    handler.handleResultRows(cursor.query, cursor.fields, tuples, cursor);
+  }
+
+  /**
+   * @param deadline a {@link System#nanoTime()} value
+   * @return the milliseconds left until the deadline, rounded up so that a wait does not end
+   *     before it, or 0 if no time is left
+   */
+  private static int millisUntil(long deadline) {
+    long left = deadline - System.nanoTime();
+    if (left <= 0) {
+      return 0;
+    }
+    long nanosPerMilli = TimeUnit.MILLISECONDS.toNanos(1);
+    return (int) Math.min(Integer.MAX_VALUE, (left + nanosPerMilli - 1) / nanosPerMilli);
   }
 
   /*

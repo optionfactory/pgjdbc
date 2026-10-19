@@ -678,4 +678,19 @@ public interface QueryExecutor extends TypeTransferModeRegistry {
    * @param streamResults desired state of results streaming
    */
   void setStreamResults(boolean streamResults);
+
+  /**
+   * Get the longest time a batch of streamed rows waits to fill up inside QueryExecutor.
+   *
+   * @return the longest time in milliseconds, 0 if a batch waits until it is full
+   */
+  int getStreamResultsMaxWait();
+
+  /**
+   * Set the longest time a batch of streamed rows waits to fill up inside QueryExecutor.
+   *
+   * @param streamResultsMaxWait the longest time in milliseconds; 0 disables the timeout and waits
+   *                             for a full batch; a negative value sets the property to 0
+   */
+  void setStreamResultsMaxWait(int streamResultsMaxWait);
 }

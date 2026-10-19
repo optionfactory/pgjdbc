@@ -317,6 +317,32 @@ public class PGStream implements Closeable, Flushable {
     return available;
   }
 
+  /**
+   * Waits for the next backend message to start arriving, for at most the given time. Call it
+   * between messages only: a message that has started arriving is read as usual.
+   *
+   * @param timeoutMillis the longest time to wait in milliseconds; 0 or less only checks the bytes
+   *     already received
+   * @return true if the first byte of the next message is available, false if the time ran out or
+   *     the stream ended
+   * @throws IOException if something wrong happens
+   */
+  public boolean waitForMessage(int timeoutMillis) throws IOException {
+    if (pgInput.available() > 0) {
+      return true;
+    }
+    if (timeoutMillis <= 0) {
+      return false;
+    }
+    int soTimeout = getNetworkTimeout();
+    connection.setSoTimeout(timeoutMillis);
+    try {
+      return pgInput.ensureBytes(1, false);
+    } finally {
+      connection.setSoTimeout(soTimeout);
+    }
+  }
+
   public void setMinStreamAvailableCheckDelay(int delay) {
     this.minStreamAvailableCheckDelay = delay;
   }

@@ -38,6 +38,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Tests for {@code streamResults}: forward-only result sets read from the socket as they are
@@ -49,6 +50,13 @@ public class StreamResultsTest extends BaseTest4 {
 
   /** Large enough not to fit in the socket buffers. */
   private static final String LARGE = "SELECT i, repeat('x', 200) FROM generate_series(1, 1000000) i";
+
+  /** Six rows, one every 250 ms: the query runs for about 1.5 seconds. */
+  private static final String SLOW = "SELECT stream_results_slow(i, 0.25) FROM generate_series(1, 6) i";
+
+  /** Twenty rows, one every 50 ms: the query runs for about a second. */
+  private static final String TRICKLE =
+      "SELECT stream_results_slow(i, 0.05) FROM generate_series(1, 20) i";
 
   /** Large enough not to fit in the socket buffers, small enough to be read in memory. */
   private static final String MEDIUM = "SELECT i, repeat('x', 200) FROM generate_series(1, 100000) i";
@@ -74,6 +82,11 @@ public class StreamResultsTest extends BaseTest4 {
       TestUtil.execute(con, "CREATE OR REPLACE FUNCTION stream_results_insert(i integer) "
           + "RETURNS integer LANGUAGE sql VOLATILE AS "
           + "'INSERT INTO stream_results VALUES ($1, null) RETURNING id'");
+      // The notice flushes the rows produced so far, which the backend would otherwise keep in its
+      // output buffer: each row reaches the driver while the next one is produced
+      TestUtil.execute(con, "CREATE OR REPLACE FUNCTION stream_results_slow(i integer, delay float8) "
+          + "RETURNS integer LANGUAGE plpgsql VOLATILE AS "
+          + "'BEGIN RAISE NOTICE ''row %'', i; PERFORM pg_sleep(delay); RETURN i; END'");
     }
   }
 
@@ -81,6 +94,7 @@ public class StreamResultsTest extends BaseTest4 {
   static void dropTables() throws Exception {
     try (Connection con = TestUtil.openDB()) {
       TestUtil.execute(con, "DROP FUNCTION IF EXISTS stream_results_insert(integer)");
+      TestUtil.execute(con, "DROP FUNCTION IF EXISTS stream_results_slow(integer, float8)");
       TestUtil.dropTable(con, "stream_results");
     }
   }
@@ -89,6 +103,8 @@ public class StreamResultsTest extends BaseTest4 {
   protected void updateProperties(Properties props) {
     super.updateProperties(props);
     PGProperty.STREAM_RESULTS.set(props, true);
+    // whatever the build sets: the tests that need a wait open their own connection
+    PGProperty.STREAM_RESULTS_MAX_WAIT.set(props, 0);
   }
 
   @Override
@@ -432,6 +448,209 @@ public class StreamResultsTest extends BaseTest4 {
       assertEquals(TransactionState.OPEN, ((PgConnection) con).getTransactionState(),
           "the generated keys were streamed");
     }
+  }
+
+  @Test
+  void maxWaitReturnsTheRowsThatArrivedBeforeTheBatchIsFull() throws Exception {
+    assumeMinimumServerVersion("pg_stat_activity.state requires PostgreSQL 9.2", ServerVersion.v9_2);
+    try (Connection maxWait = openWithMaxWait(100);
+         Statement stmt = maxWait.createStatement()) {
+      stmt.setFetchSize(100);
+      try (ResultSet rs = stmt.executeQuery(SLOW)) {
+        assertTrue(rs.next());
+        assertEquals(1, rs.getInt(1));
+        // the batch of 100 rows is not full: the query is still producing the next rows
+        assertEquals("active", backendState(maxWait), "state of the backend after the first row");
+        assertEquals(7, readInOrder(rs, 2), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void maxWaitCollectsTheRowsThatArriveInTime() throws Exception {
+    assumeMinimumServerVersion("pg_stat_activity.state requires PostgreSQL 9.2", ServerVersion.v9_2);
+    try (Connection maxWait = openWithMaxWait(300);
+         Statement stmt = maxWait.createStatement()) {
+      stmt.setFetchSize(100);
+      long start = System.nanoTime();
+      try (ResultSet rs = stmt.executeQuery(TRICKLE)) {
+        assertTrue(rs.next());
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        // the batch of 100 rows cannot fill up: it takes the rows that arrive in 300 ms
+        assertTrue(elapsedMillis >= 300, () -> "first row after " + elapsedMillis + " ms");
+        assertEquals("active", backendState(maxWait), "state of the backend after the first row");
+        assertEquals(1, rs.getInt(1));
+        assertEquals(21, readInOrder(rs, 2), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void withoutMaxWaitTheFirstBatchWaitsToFillUp() throws Exception {
+    assumeMinimumServerVersion("pg_stat_activity.state requires PostgreSQL 9.2", ServerVersion.v9_2);
+    try (Statement stmt = con.createStatement()) {
+      stmt.setFetchSize(100);
+      try (ResultSet rs = stmt.executeQuery(SLOW)) {
+        assertTrue(rs.next());
+        // the batch of 100 rows waited for the end of the result
+        assertEquals("idle", backendState(con), "state of the backend after the first row");
+        assertEquals(7, readInOrder(rs, 2), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void maxWaitReturnsEveryRowInOrder() throws Exception {
+    // a 1 ms wait hands a batch over whenever the rows received so far are read
+    try (Connection maxWait = openWithMaxWait(1);
+         Statement stmt = maxWait.createStatement()) {
+      stmt.setFetchSize(1000);
+      try (ResultSet rs = stmt.executeQuery(LARGE)) {
+        assertEquals(1000001, readInOrder(rs, 1), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void maxWaitDoesNotApplyWhenTheRestIsReadInMemory() throws Exception {
+    try (Connection maxWait = openWithMaxWait(100);
+         Statement stmt = maxWait.createStatement()) {
+      stmt.setFetchSize(100);
+      try (ResultSet rs = stmt.executeQuery(SLOW)) {
+        assertTrue(rs.next());
+        assertEquals(1, rs.getInt(1));
+        // reads the rest of the result, waiting for the query to end
+        try (Statement other = maxWait.createStatement()) {
+          assertEquals(42, count(other, "SELECT 42"));
+        }
+        assertEquals(7, readInOrder(rs, 2), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void maxWaitRestoresTheNetworkTimeout() throws Exception {
+    try (Connection maxWait = openWithMaxWait(100);
+         Statement stmt = maxWait.createStatement()) {
+      maxWait.setNetworkTimeout(Runnable::run, 30000);
+      stmt.setFetchSize(100);
+      // the rows arrive faster than the wait runs out: each batch waits on the socket
+      try (ResultSet rs = stmt.executeQuery(TRICKLE)) {
+        assertEquals(21, readInOrder(rs, 1), "next row number after the last one");
+      }
+      assertEquals(30000, maxWait.getNetworkTimeout());
+    }
+  }
+
+  @Test
+  void setStreamResultsMaxWaitAppliesToTheNextQueries() throws Exception {
+    assumeMinimumServerVersion("pg_stat_activity.state requires PostgreSQL 9.2", ServerVersion.v9_2);
+    PGConnection pgConnection = con.unwrap(PGConnection.class);
+    try (Statement stmt = con.createStatement()) {
+      pgConnection.setStreamResultsMaxWait(100);
+      assertEquals(100, pgConnection.getStreamResultsMaxWait());
+      stmt.setFetchSize(100);
+      try (ResultSet rs = stmt.executeQuery(SLOW)) {
+        assertTrue(rs.next());
+        assertEquals("active", backendState(con),
+            "a statement created before setStreamResultsMaxWait(100) waited for a full batch");
+        assertEquals(7, readInOrder(rs, 2), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void setStreamResultsMaxWaitDoesNotChangeOpenResultSets() throws Exception {
+    assumeMinimumServerVersion("pg_stat_activity.state requires PostgreSQL 9.2", ServerVersion.v9_2);
+    try (Connection maxWait = openWithMaxWait(100);
+         Statement stmt = maxWait.createStatement()) {
+      stmt.setFetchSize(100);
+      try (ResultSet rs = stmt.executeQuery(SLOW)) {
+        assertTrue(rs.next());
+        maxWait.unwrap(PGConnection.class).setStreamResultsMaxWait(0);
+        assertTrue(rs.next());
+        assertEquals(2, rs.getInt(1));
+        // the result set keeps its 100 ms wait: its second batch did not wait for a full batch
+        assertEquals("active", backendState(maxWait), "state of the backend after the second row");
+        assertEquals(7, readInOrder(rs, 3), "next row number after the last one");
+      }
+    }
+  }
+
+  @Test
+  void setStreamResultsMaxWaitTakesNegativeValuesAsZero() throws Exception {
+    PGConnection pgConnection = con.unwrap(PGConnection.class);
+    pgConnection.setStreamResultsMaxWait(-1);
+    assertEquals(0, pgConnection.getStreamResultsMaxWait());
+  }
+
+  @Test
+  void earlyCloseAfterAPartialBatchAbortsTheTransaction() throws Exception {
+    try (Connection maxWait = openWithMaxWait(100);
+         Statement stmt = maxWait.createStatement()) {
+      maxWait.setAutoCommit(false);
+      stmt.setFetchSize(100);
+      try (ResultSet rs = stmt.executeQuery(SLOW)) {
+        assertTrue(rs.next());
+      }
+      assertEquals(TransactionState.FAILED,
+          maxWait.unwrap(PgConnection.class).getTransactionState());
+      maxWait.rollback();
+    }
+  }
+
+  @Test
+  void errorsAfterAPartialBatchAreThrownByNext() throws Exception {
+    try (Connection maxWait = openWithMaxWait(50);
+         Statement stmt = maxWait.createStatement()) {
+      stmt.setFetchSize(100);
+      int[] rows = {0};
+      try (ResultSet rs = stmt.executeQuery(
+          "SELECT stream_results_slow(i, 0.1) / (4 - i) FROM generate_series(1, 6) i")) {
+        SQLException e = assertThrows(SQLException.class, () -> {
+          while (rs.next()) {
+            rows[0]++;
+          }
+        });
+        assertEquals(PSQLState.DIVISION_BY_ZERO.getState(), e.getSQLState());
+      }
+      // the rows before the error were returned
+      assertTrue(rows[0] >= 1 && rows[0] <= 3, () -> rows[0] + " rows");
+      assertEquals(1, count(stmt, "SELECT 1"));
+    }
+  }
+
+  private Connection openWithMaxWait(int maxWait) throws Exception {
+    Properties props = new Properties();
+    updateProperties(props);
+    PGProperty.STREAM_RESULTS_MAX_WAIT.set(props, maxWait);
+    return TestUtil.openDB(props);
+  }
+
+  private static String backendState(Connection streaming) throws SQLException {
+    try (Connection observer = TestUtil.openDB();
+         PreparedStatement ps = observer.prepareStatement(
+             "SELECT state FROM pg_stat_activity WHERE pid = ?")) {
+      ps.setInt(1, streaming.unwrap(PGConnection.class).getBackendPID());
+      try (ResultSet rs = ps.executeQuery()) {
+        assertTrue(rs.next());
+        return rs.getString(1);
+      }
+    }
+  }
+
+  /**
+   * Reads the rest of a result whose first column numbers the rows.
+   *
+   * @return the number the row after the last one would have
+   */
+  private static int readInOrder(ResultSet rs, int first) throws SQLException {
+    int expected = first;
+    while (rs.next()) {
+      assertEquals(expected, rs.getInt(1), "row number");
+      expected++;
+    }
+    return expected;
   }
 
   private int countRows(String sql, int fetchSize) throws SQLException {

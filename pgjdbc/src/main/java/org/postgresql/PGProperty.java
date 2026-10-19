@@ -899,6 +899,18 @@ public enum PGProperty {
       "Stream forward-only result sets from the socket without cursors or full buffering."),
 
   /**
+   * The longest time, in milliseconds, that reading a batch of streamed rows waits for the batch to
+   * fill up. When it runs out, the rows read so far are returned, if there is at least one, even if
+   * there are fewer than the fetch size. The time counts from when the driver starts reading the
+   * batch. 0, the default, waits until the batch is full or the result ends. Applies only when
+   * {@link #STREAM_RESULTS} is enabled.
+   */
+  STREAM_RESULTS_MAX_WAIT(
+      "streamResultsMaxWait",
+      "0",
+      "The longest time in milliseconds a batch of streamed rows waits to fill up before the rows read so far are returned; 0 waits for a full batch."),
+
+  /**
    * Bind String to either {@code unspecified} or {@code varchar}. Default is {@code varchar} for
    * 8.0+ backends.
    */

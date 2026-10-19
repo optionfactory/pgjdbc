@@ -167,6 +167,16 @@ cursor, as described in the previous section.
 An open connection can turn streaming on or off with `PGConnection.setStreamResults(boolean)`. The change applies to
 the queries executed after it, by new and existing statements; result sets already open are not affected.
 
+With the `streamResultsMaxWait` connection property set to a positive number of milliseconds, a batch does not wait
+longer than that to fill up: when the time runs out, `next()` returns with the rows read so far, at least one, even if
+they are fewer than the fetch size. The time counts from when the driver starts reading the batch, that is when the
+query is sent or when `next()` needs the next batch. Rows that arrive quickly still fill whole batches, while a slow
+query hands its rows over as they come, so one large fetch size suits fast and slow queries alike. PostgreSQL buffers
+the rows it sends, about 8 kB at a time: the small rows of a slow query reach the driver when that buffer fills up or
+the query ends. `streamResultsMaxWait` does not apply when the rest of a result is read in memory. An open
+connection can change it with `PGConnection.setStreamResultsMaxWait(int)`: the change applies to the queries
+executed after it, and a result set keeps the value its query started with.
+
 Until the `ResultSet` has read its last row or is closed, the rest of its rows are still in the socket:
 
 * Any other operation on the same connection, such as running another statement, committing, or a `COPY`, first
@@ -198,7 +208,7 @@ The following read the whole result, as before:
 ##### Streaming a large result
 
 ```java
-// jdbc:postgresql://localhost/test?streamResults=true
+// jdbc:postgresql://localhost/test?streamResults=true&streamResultsMaxWait=100
 try (Statement st = conn.createStatement();
      ResultSet rs = st.executeQuery("SELECT * FROM mytable")) {
     while (rs.next()) {

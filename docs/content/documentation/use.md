@@ -530,6 +530,13 @@ generated keys and statements protected by an `autosave` savepoint read the whol
 does not apply to streamed results. An open connection can change the setting with
 `PGConnection.setStreamResults(boolean)`. See [Streaming results](/documentation/query/#streaming-results).
 
+* **`streamResultsMaxWait (`*int*`)`** *Default `0`*\
+The longest time, in milliseconds, that reading a batch of streamed rows waits for the batch to fill up. When it runs
+out, `ResultSet.next()` returns with the rows read so far, at least one, even if they are fewer than the fetch size.
+The time counts from when the driver starts reading the batch. `0` waits until the batch is full or the result ends.
+Requires `streamResults` set to `true`. An open connection can change the setting with
+`PGConnection.setStreamResultsMaxWait(int)`. See [Streaming results](/documentation/query/#streaming-results).
+
 * **`logServerErrorDetail (`*boolean*`)`** *Default `true`*\
 Whether to include server error details in exceptions and log messages (for example inlined query parameters).
 Setting to `false` will only include minimal, not sensitive messages.
